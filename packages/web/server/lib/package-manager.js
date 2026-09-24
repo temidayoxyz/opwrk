@@ -1,0 +1,614 @@
+import { spawnSync } from 'child_process';
+import fs from 'fs';
+import path from 'path';
+import { fileURLToPath } from 'url';
+import { z } from 'zod';
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+
+const PACKAGE_NAME = '@openchamber/web';
+const PACKAGE_PATH_SEGMENTS = PACKAGE_NAME.split('/');
+const GITHUB_RELEASES_URL = 'https://github.com/temidayoxyz/opwrk/releases';
+const GITHUB_RELEASES_API_URL = 'https://api.github.com/repos/temidayoxyz/opwrk/releases';
+let cachedDetectedPm = null;
+
+function getSpawnSyncBaseOptions() {
+  return process.platform === 'win32' ? { windowsHide: true } : {};
+}
+
+function mapPlatform(value) {
+  if (value === 'darwin') return 'macos';
+  if (value === 'win32') return 'windows';
+  if (value === 'linux') return 'linux';
+  return 'web';
+}
+
+function normalizeAppType(value) {
+  if (value === 'web' || value === 'desktop-electron' || value === 'vscode' || value === 'mobile-capacitor') return value;
+  return 'web';
+}
+
+function normalizePlatform(value) {
+  if (value === 'macos' || value === 'windows' || value === 'linux' || value === 'web' || value === 'android' || value === 'ios') return value;
+  return mapPlatform(process.platform);
+}
+
+function normalizePathForComparison(filePath) {
+  if (!filePath || typeof filePath !== 'string') return null;
+  const normalized = path.normalize(path.resolve(filePath));
+  return process.platform === 'win32' ? normalized.toLowerCase() : normalized;
+}
+
+function getComparablePaths(filePath) {
+  const paths = new Set();
+  const normalized = normalizePathForComparison(filePath);
+  if (normalized) {
+    paths.add(normalized);
+  }
+
+  try {
+    const realPath = fs.realpathSync.native ? fs.realpathSync.native(filePath) : fs.realpathSync(filePath);
+    const normalizedRealPath = normalizePathForComparison(realPath);
+    if (normalizedRealPath) {
+      paths.add(normalizedRealPath);
+    }
+  } catch {
+  }
+
+  return paths;
+}
+
+function pathSetContains(a, b) {
+  for (const value of a) {
+    if (b.has(value)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+function getCurrentPackagePath() {
+  return path.resolve(__dirname, '..', '..');
+}
+
+function getPackagePathForGlobalRoot(rootPath) {
+  if (!rootPath) return null;
+  return path.join(rootPath, ...PACKAGE_PATH_SEGMENTS);
+}
+
+function getUniquePaths(paths) {
+  const seen = new Set();
+  const result = [];
+  for (const value of paths) {
+    const normalized = normalizePathForComparison(value);
+    if (!normalized || seen.has(normalized)) continue;
+    seen.add(normalized);
+    result.push(path.resolve(value));
+  }
+  return result;
+}
+
+function getCommandOutput(command, args) {
+  try {
+    const result = spawnSync(command, args, {
+      encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'pipe'],
+      timeout: 10000,
+      ...getSpawnSyncBaseOptions(),
+    });
+
+    if (result.status !== 0) {
+      return null;
+    }
+
+    const stdout = result.stdout.trim();
+    return stdout || null;
+  } catch {
+    return null;
+  }
+}
+
+function getGlobalBinDirs(pm) {
+  const pmCommand = resolvePackageManagerCommand(pm);
+  if (!isCommandAvailable(pmCommand)) {
+    return [];
+  }
+
+  const dirs = [];
+  switch (pm) {
+    case 'pnpm': {
+      const pnpmBin = getCommandOutput(pmCommand, ['bin', '-g']);
+      if (pnpmBin) dirs.push(pnpmBin);
+      const pnpmPrefix = getCommandOutput(pmCommand, ['prefix', '-g']);
+      if (pnpmPrefix) dirs.push(process.platform === 'win32' ? pnpmPrefix : path.join(pnpmPrefix, 'bin'));
+      break;
+    }
+    case 'yarn': {
+      const yarnBin = getCommandOutput(pmCommand, ['global', 'bin']);
+      if (yarnBin) dirs.push(yarnBin);
+      break;
+    }
+    case 'bun': {
+      const bunBin = getCommandOutput(pmCommand, ['pm', 'bin', '-g']);
+      if (bunBin) dirs.push(bunBin);
+      break;
+    }
+    default: {
+      const npmPrefix = getCommandOutput(pmCommand, ['prefix', '-g']);
+      if (npmPrefix) dirs.push(process.platform === 'win32' ? npmPrefix : path.join(npmPrefix, 'bin'));
+      break;
+    }
+  }
+
+  return getUniquePaths(dirs);
+}
+
+function getGlobalNodeModulesRoots(pm) {
+  try {
+    const pmCommand = resolvePackageManagerCommand(pm);
+    if (!isCommandAvailable(pmCommand)) {
+      return [];
+    }
+
+    const roots = [];
+
+    switch (pm) {
+      case 'pnpm': {
+        const pnpmRoot = getCommandOutput(pmCommand, ['root', '-g']);
+        if (pnpmRoot) roots.push(pnpmRoot);
+        const pnpmPrefix = getCommandOutput(pmCommand, ['prefix', '-g']);
+        if (pnpmPrefix) roots.push(process.platform === 'win32' ? path.join(pnpmPrefix, 'node_modules') : path.join(pnpmPrefix, 'lib', 'node_modules'));
+        break;
+      }
+      case 'yarn': {
+        const yarnDir = getCommandOutput(pmCommand, ['global', 'dir']);
+        if (yarnDir) roots.push(path.join(yarnDir, 'node_modules'));
+        break;
+      }
+      case 'bun': {
+        const bunBinDir = getCommandOutput(pmCommand, ['pm', 'bin', '-g']);
+        if (bunBinDir) {
+          roots.push(path.resolve(bunBinDir, '..', 'install', 'global', 'node_modules'));
+          roots.push(path.resolve(bunBinDir, '..', '..', 'node_modules'));
+        }
+        break;
+      }
+      default:
+      {
+        const npmRoot = getCommandOutput(pmCommand, ['root', '-g']);
+        if (npmRoot) roots.push(npmRoot);
+        const npmPrefix = getCommandOutput(pmCommand, ['prefix', '-g']);
+        if (npmPrefix) roots.push(process.platform === 'win32' ? path.join(npmPrefix, 'node_modules') : path.join(npmPrefix, 'lib', 'node_modules'));
+        break;
+      }
+    }
+
+    return getUniquePaths(roots);
+  } catch {
+    return [];
+  }
+}
+
+function getOwnedPackagePathsFromGlobalBins(pm) {
+  const packagePaths = [];
+  for (const binDir of getGlobalBinDirs(pm)) {
+    const binaryName = process.platform === 'win32' ? 'openchamber.cmd' : 'openchamber';
+    const binaryPath = path.join(binDir, binaryName);
+    if (!fs.existsSync(binaryPath)) continue;
+
+    try {
+      const realBinaryPath = fs.realpathSync.native ? fs.realpathSync.native(binaryPath) : fs.realpathSync(binaryPath);
+      packagePaths.push(path.resolve(realBinaryPath, '..', '..'));
+    } catch {
+    }
+  }
+
+  return getUniquePaths(packagePaths);
+}
+
+function detectPackageManagerFromCurrentInstallPath() {
+  return detectPackageManagerFromInstallPath(getCurrentPackagePath());
+}
+
+function packageManagerOwnsCurrentInstall(pm) {
+  const currentPackagePaths = getComparablePaths(getCurrentPackagePath());
+  const candidatePackagePaths = [
+    ...getGlobalNodeModulesRoots(pm).map(getPackagePathForGlobalRoot),
+    ...getOwnedPackagePathsFromGlobalBins(pm),
+  ];
+
+  for (const candidatePath of candidatePackagePaths) {
+    if (!candidatePath) continue;
+    if (pathSetContains(currentPackagePaths, getComparablePaths(candidatePath))) {
+      return true;
+    }
+  }
+
+  return false;
+}
+
+export function detectPackageManagerDetails() {
+  // In desktop (Electron) runtime, package-manager detection is worthless —
+  // the app ships as a .app bundle, not installed via npm/pnpm/yarn/bun, and
+  // updates are handled by electron-updater. The detection path does up to a
+  // dozen spawnSync(pm, ['bin', '-g']) calls with 10s timeouts each; under
+  // the in-process server every one blocks the Electron main event loop and
+  // manifests as a multi-second UI freeze. Short-circuit here.
+  if (process.env.OPENCHAMBER_RUNTIME === 'desktop') {
+    return {
+      packageManager: 'electron',
+      reason: 'desktop-runtime',
+      packagePath: null,
+      packageManagerCommand: null,
+      globalNodeModulesRoot: null,
+    };
+  }
+
+  if (cachedDetectedPm) {
+      return {
+        packageManager: cachedDetectedPm,
+        reason: 'cached',
+        packagePath: getCurrentPackagePath(),
+        packageManagerCommand: resolvePackageManagerCommand(cachedDetectedPm),
+        globalNodeModulesRoot: getGlobalNodeModulesRoots(cachedDetectedPm)[0] || null,
+      };
+  }
+
+  const forcedPm = process.env.OPENCHAMBER_PACKAGE_MANAGER?.trim();
+  if (forcedPm && ['npm', 'pnpm', 'yarn', 'bun'].includes(forcedPm)) {
+    const forcedPmCommand = resolvePackageManagerCommand(forcedPm);
+    if (isCommandAvailable(forcedPmCommand)) {
+      cachedDetectedPm = forcedPm;
+      return {
+        packageManager: cachedDetectedPm,
+        reason: 'forced-env',
+        packagePath: getCurrentPackagePath(),
+        packageManagerCommand: forcedPmCommand,
+        globalNodeModulesRoot: getGlobalNodeModulesRoots(cachedDetectedPm)[0] || null,
+      };
+    }
+  }
+
+  // First prefer the package manager that demonstrably owns the current install.
+  const installPathPm = detectPackageManagerFromCurrentInstallPath();
+  if (installPathPm && packageManagerOwnsCurrentInstall(installPathPm)) {
+    cachedDetectedPm = installPathPm;
+    return {
+      packageManager: cachedDetectedPm,
+      reason: 'install-path-owner',
+      packagePath: getCurrentPackagePath(),
+      packageManagerCommand: resolvePackageManagerCommand(cachedDetectedPm),
+      globalNodeModulesRoot: getGlobalNodeModulesRoots(cachedDetectedPm)[0] || null,
+    };
+  }
+
+  const ownershipCandidates = ['pnpm', 'yarn', 'bun', 'npm'];
+  for (const candidate of ownershipCandidates) {
+    if (packageManagerOwnsCurrentInstall(candidate)) {
+      cachedDetectedPm = candidate;
+      return {
+        packageManager: cachedDetectedPm,
+        reason: 'global-root-owner',
+        packagePath: getCurrentPackagePath(),
+        packageManagerCommand: resolvePackageManagerCommand(cachedDetectedPm),
+        globalNodeModulesRoot: getGlobalNodeModulesRoots(cachedDetectedPm)[0] || null,
+      };
+    }
+  }
+
+  // Fall back to weaker hints only when ownership cannot be established.
+  const userAgent = process.env.npm_config_user_agent || '';
+  let hintedPm = null;
+  if (userAgent.startsWith('pnpm')) hintedPm = 'pnpm';
+  else if (userAgent.startsWith('yarn')) hintedPm = 'yarn';
+  else if (userAgent.startsWith('bun')) hintedPm = 'bun';
+  else if (userAgent.startsWith('npm')) hintedPm = 'npm';
+
+  // Check execpath.
+  const execPath = process.env.npm_execpath || '';
+  if (!hintedPm) {
+    if (execPath.includes('pnpm')) hintedPm = 'pnpm';
+    else if (execPath.includes('yarn')) hintedPm = 'yarn';
+    else if (execPath.includes('bun')) hintedPm = 'bun';
+    else if (execPath.includes('npm')) hintedPm = 'npm';
+  }
+
+  // Detect from invoked binary path.
+  const invokedPm = detectPackageManagerFromInvocationPath(process.argv?.[1]);
+  if (!hintedPm) {
+    hintedPm = invokedPm;
+  }
+
+  if (!hintedPm) {
+    hintedPm = installPathPm;
+  }
+
+  // Validate the hint against package visibility, but only after ownership checks failed.
+  if (hintedPm && isCommandAvailable(resolvePackageManagerCommand(hintedPm)) && isPackageInstalledWith(hintedPm)) {
+    cachedDetectedPm = hintedPm;
+    return {
+      packageManager: cachedDetectedPm,
+      reason: 'hinted-visible-install',
+      packagePath: getCurrentPackagePath(),
+      packageManagerCommand: resolvePackageManagerCommand(cachedDetectedPm),
+      globalNodeModulesRoot: getGlobalNodeModulesRoots(cachedDetectedPm)[0] || null,
+    };
+  }
+
+  const runtimePm = detectPackageManagerFromRuntimePath(process.execPath);
+  if (runtimePm && isCommandAvailable(resolvePackageManagerCommand(runtimePm)) && isPackageInstalledWith(runtimePm)) {
+    cachedDetectedPm = runtimePm;
+    return {
+      packageManager: cachedDetectedPm,
+      reason: 'runtime-visible-install',
+      packagePath: getCurrentPackagePath(),
+      packageManagerCommand: resolvePackageManagerCommand(cachedDetectedPm),
+      globalNodeModulesRoot: getGlobalNodeModulesRoots(cachedDetectedPm)[0] || null,
+    };
+  }
+
+  // Last resort: pick a PM that can at least see the package.
+  const pmChecks = [
+    { name: 'pnpm', check: () => isCommandAvailable(resolvePackageManagerCommand('pnpm')) },
+    { name: 'yarn', check: () => isCommandAvailable(resolvePackageManagerCommand('yarn')) },
+    { name: 'bun', check: () => isCommandAvailable(resolvePackageManagerCommand('bun')) },
+    { name: 'npm', check: () => isCommandAvailable(resolvePackageManagerCommand('npm')) },
+  ];
+
+  for (const { name, check } of pmChecks) {
+    if (check()) {
+      // Verify this PM actually has the package installed globally
+      if (isPackageInstalledWith(name)) {
+        cachedDetectedPm = name;
+        return {
+          packageManager: cachedDetectedPm,
+          reason: 'last-resort-visible-install',
+          packagePath: getCurrentPackagePath(),
+          packageManagerCommand: resolvePackageManagerCommand(cachedDetectedPm),
+          globalNodeModulesRoot: getGlobalNodeModulesRoots(cachedDetectedPm)[0] || null,
+        };
+      }
+    }
+  }
+
+  cachedDetectedPm = 'npm';
+  return {
+    packageManager: cachedDetectedPm,
+    reason: 'default-fallback',
+    packagePath: getCurrentPackagePath(),
+    packageManagerCommand: resolvePackageManagerCommand(cachedDetectedPm),
+    globalNodeModulesRoot: getGlobalNodeModulesRoots(cachedDetectedPm)[0] || null,
+  };
+}
+
+export function detectPackageManager() {
+  return detectPackageManagerDetails().packageManager;
+}
+
+function detectPackageManagerFromInstallPath(pkgPath) {
+  if (!pkgPath) return null;
+  const normalized = pkgPath.replace(/\\/g, '/').toLowerCase();
+  if (normalized.includes('/.pnpm/') || normalized.includes('/pnpm/')) return 'pnpm';
+  if (normalized.includes('/.yarn/')) return 'yarn';
+  if (normalized.includes('/.bun/') || normalized.includes('/bun/install/')) return 'bun';
+  if (normalized.includes('/node_modules/')) return 'npm';
+  return null;
+}
+
+function detectPackageManagerFromRuntimePath(runtimePath) {
+  if (!runtimePath || typeof runtimePath !== 'string') return null;
+  const normalized = runtimePath.replace(/\\/g, '/').toLowerCase();
+  if (normalized.includes('/.bun/bin/bun') || normalized.endsWith('/bun') || normalized.endsWith('/bun.exe')) {
+    return 'bun';
+  }
+  if (normalized.includes('/pnpm/')) return 'pnpm';
+  if (normalized.includes('/yarn/')) return 'yarn';
+  if (normalized.includes('/node') || normalized.endsWith('/node.exe')) return 'npm';
+  return null;
+}
+
+function detectPackageManagerFromInvocationPath(invokedPath) {
+  if (!invokedPath || typeof invokedPath !== 'string') return null;
+  const normalized = invokedPath.replace(/\\/g, '/').toLowerCase();
+  if (normalized.includes('/.bun/bin/')) return 'bun';
+  if (normalized.includes('/.pnpm/')) return 'pnpm';
+  if (normalized.includes('/.yarn/')) return 'yarn';
+  return null;
+}
+
+function getPackageManagerCommandCandidates(pm) {
+  const candidates = [];
+  if (pm === 'bun') {
+    const bunExecutable = process.platform === 'win32' ? 'bun.exe' : 'bun';
+    if (process.env.BUN_INSTALL) {
+      candidates.push(path.join(process.env.BUN_INSTALL, 'bin', bunExecutable));
+    }
+    if (process.env.HOME) {
+      candidates.push(path.join(process.env.HOME, '.bun', 'bin', bunExecutable));
+    }
+    if (process.env.USERPROFILE) {
+      candidates.push(path.join(process.env.USERPROFILE, '.bun', 'bin', bunExecutable));
+    }
+  }
+  candidates.push(pm);
+  return [...new Set(candidates.filter(Boolean))];
+}
+
+function resolvePackageManagerCommand(pm) {
+  const candidates = getPackageManagerCommandCandidates(pm);
+  for (const candidate of candidates) {
+    if (isCommandAvailable(candidate)) {
+      return candidate;
+    }
+  }
+  return pm;
+}
+
+
+function isCommandAvailable(command) {
+  try {
+    const result = spawnSync(command, ['--version'], {
+      encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'pipe'],
+      timeout: 5000,
+      ...getSpawnSyncBaseOptions(),
+    });
+    return result.status === 0;
+  } catch {
+    return false;
+  }
+}
+
+function isPackageInstalledWith(pm) {
+  try {
+    const pmCommand = resolvePackageManagerCommand(pm);
+    let args;
+    switch (pm) {
+      case 'pnpm':
+        args = ['list', '-g', '--depth=0', PACKAGE_NAME];
+        break;
+      case 'yarn':
+        args = ['global', 'list', '--depth=0'];
+        break;
+      case 'bun':
+        args = ['pm', 'ls', '-g'];
+        break;
+      default:
+        args = ['list', '-g', '--depth=0', PACKAGE_NAME];
+    }
+
+    const result = spawnSync(pmCommand, args, {
+      encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'pipe'],
+      timeout: 10000,
+      ...getSpawnSyncBaseOptions(),
+    });
+
+    if (result.status !== 0) return false;
+    return result.stdout.includes(PACKAGE_NAME) || result.stdout.includes('openchamber');
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Get the update command for the detected package manager
+ */
+export function getUpdateCommand() {
+  throw new Error('OpWrk web self-update is unavailable until an OpWrk package is published.');
+}
+
+/**
+ * Get current installed version from package.json
+ */
+export function getCurrentVersion() {
+  try {
+    const pkgPath = path.resolve(__dirname, '..', '..', 'package.json');
+    const pkg = JSON.parse(fs.readFileSync(pkgPath, 'utf8'));
+    return pkg.version || 'unknown';
+  } catch {
+    return 'unknown';
+  }
+}
+
+
+/**
+ * Compare semver-like version strings.
+ */
+function parseVersionForComparison(value) {
+  const normalized = String(value || '').replace(/^v/, '').split('+')[0];
+  const prereleaseIndex = normalized.indexOf('-');
+  const core = prereleaseIndex >= 0 ? normalized.slice(0, prereleaseIndex) : normalized;
+  const parts = core.split('.').map((part) => {
+    const parsed = Number.parseInt(part || '0', 10);
+    return Number.isFinite(parsed) ? parsed : 0;
+  });
+
+  return {
+    parts,
+    prerelease: prereleaseIndex >= 0,
+  };
+}
+
+function compareVersions(left, right) {
+  const a = parseVersionForComparison(left);
+  const b = parseVersionForComparison(right);
+  const length = Math.max(a.parts.length, b.parts.length);
+
+  for (let index = 0; index < length; index += 1) {
+    const diff = (a.parts[index] || 0) - (b.parts[index] || 0);
+    if (diff !== 0) return diff;
+  }
+
+  if (a.prerelease !== b.prerelease) {
+    return a.prerelease ? -1 : 1;
+  }
+
+  return 0;
+}
+
+
+export async function checkForUpdates(options = {}) {
+  const currentVersion = options.currentVersion || getCurrentVersion();
+  const appType = normalizeAppType(options.appType);
+  const platform = normalizePlatform(options.platform);
+  let response;
+  try {
+    response = await fetch(`${GITHUB_RELEASES_API_URL}/latest`, {
+      headers: {
+        Accept: 'application/vnd.github+json',
+        'User-Agent': 'opwrk-update-check',
+      },
+      signal: AbortSignal.timeout(10000),
+    });
+  } catch {
+    return { available: false, currentVersion, error: 'Could not reach OpWrk releases.' };
+  }
+  if (response.status === 404) {
+    return { available: false, currentVersion, nextSuggestedCheckInSec: 86400 };
+  }
+  if (!response.ok) {
+    return { available: false, currentVersion, error: `OpWrk release check failed (${response.status}).` };
+  }
+  let release;
+  try {
+    release = await response.json();
+  } catch {
+    return { available: false, currentVersion, error: 'OpWrk release information was invalid.' };
+  }
+  const tagResult = z.string().regex(/^v\d+\.\d+\.\d+$/).safeParse(release?.tag_name);
+  if (!tagResult.success) {
+    return { available: false, currentVersion, error: 'OpWrk release version was invalid.' };
+  }
+  const tag = tagResult.data;
+  const bodyResult = z.string().safeParse(release.body);
+  const assetsResult = z.array(z.object({
+    name: z.string(),
+    browser_download_url: z.url(),
+  })).safeParse(release.assets);
+  const version = tag.slice(1);
+  const newer = currentVersion !== 'unknown' && compareVersions(version, currentVersion) > 0;
+  const apk = appType === 'mobile-capacitor' && platform === 'android' && newer && assetsResult.success
+    ? assetsResult.data.find((asset) => /^OpWrk-.+-android\.apk$/i.test(asset.name)
+      && asset.browser_download_url.startsWith(`${GITHUB_RELEASES_URL}/download/${tag}/`))
+    : undefined;
+  return {
+    available: Boolean(apk),
+    version,
+    currentVersion,
+    body: bodyResult.success ? bodyResult.data : undefined,
+    releaseUrl: `${GITHUB_RELEASES_URL}/tag/${tag}`,
+    downloadUrl: apk?.browser_download_url,
+    nextSuggestedCheckInSec: 86400,
+  };
+}
+
+/**
+ * Execute the update (used by CLI)
+ */
+export function executeUpdate(pm = detectPackageManager(), options = {}) {
+  void pm;
+  void options;
+  return { success: false, exitCode: 1 };
+}
